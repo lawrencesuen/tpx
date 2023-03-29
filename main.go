@@ -82,30 +82,29 @@ func (tpx *TPXServer) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	// check if connection is allowed
-	if tpx.apiURL != "" || tpx.accessToken != "" {
-		// there is an api url or access token, so we need to check if the connection is allowed
-		// get the ip address of the client
-		ip, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-		if err != nil {
-			if tpx.debug >= TPXDebugLevelInfo {
-				log.Println("error getting remote address: ", err.Error())
-			}
-			return
+	// there is an api url or access token, so we need to check if the connection is allowed
+	// get the ip address of the client
+	ip, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+	if err != nil {
+		if tpx.debug >= TPXDebugLevelInfo {
+			log.Println("error getting remote address: ", err.Error())
 		}
-		// check if the ip is allowed
-		accessControlResult, ok := tpx.ipAccessControl[ip]
-
-		if !ok {
-			accessControlResult = tpx.defaultAllow
-		}
-
-		if !accessControlResult {
-			if tpx.debug >= TPXDebugLevelInfo {
-				log.Println("ip not allowed: ", ip)
-			}
-			return
-		}
+		return
 	}
+	// check if the ip is allowed
+	accessControlResult, ok := tpx.ipAccessControl[ip]
+
+	if !ok {
+		accessControlResult = tpx.defaultAllow
+	}
+
+	if !accessControlResult {
+		if tpx.debug >= TPXDebugLevelInfo {
+			log.Println("ip not allowed: ", ip)
+		}
+		return
+	}
+
 	// create reader and writer
 	tlsParserConnection, err := tlsparser.NewConn(conn)
 	if err != nil {
