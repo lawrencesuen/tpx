@@ -38,11 +38,12 @@ import (
 )
 
 type TPXServer struct {
-	debug       TPXDebugLevel
-	resolver    *net.Resolver
-	ipAllowed   map[string]bool
-	apiURL      string
-	accessToken string
+	debug           TPXDebugLevel
+	resolver        *net.Resolver
+	ipAccessControl map[string]bool
+	apiURL          string
+	accessToken     string
+	defaultAllow    bool
 }
 
 type TPXDebugLevel int
@@ -55,10 +56,10 @@ const (
 
 func NewTPXServer(dnsIP string, debug TPXDebugLevel, apiURL string, accessToken string) *TPXServer {
 	tpx := &TPXServer{
-		debug:       debug,
-		ipAllowed:   map[string]bool{},
-		apiURL:      apiURL,
-		accessToken: accessToken,
+		debug:           debug,
+		ipAccessControl: map[string]bool{},
+		apiURL:          apiURL,
+		accessToken:     accessToken,
 		resolver: &net.Resolver{
 			PreferGo: true,
 		},
@@ -92,7 +93,13 @@ func (tpx *TPXServer) handleConnection(conn net.Conn) {
 			return
 		}
 		// check if the ip is allowed
-		if !tpx.ipAllowed[ip] {
+		accessControlResult, ok := tpx.ipAccessControl[ip]
+
+		if !ok {
+			accessControlResult = tpx.defaultAllow
+		}
+
+		if !accessControlResult {
 			if tpx.debug >= TPXDebugLevelInfo {
 				log.Println("ip not allowed: ", ip)
 			}
@@ -185,11 +192,13 @@ func (tpx *TPXServer) handleConnection(conn net.Conn) {
 	}
 }
 
-type GetAllowedIPJSON struct {
-	AllowedIPs []string `json:"allowed_ips"`
+type ConfigJSON struct {
+	DefaultAllow bool     `json:"defaultAllow"`
+	AllowedIPs   []string `json:"allowedIPs"`
+	BlockedIPs   []string `json:"blockedIPs"`
 }
 
-func (tpx *TPXServer) updateAllowedIPs() error {
+func (tpx *TPXServer) getConfig() error {
 	// create a new request
 	req, err := http.NewRequest("GET", tpx.apiURL, nil)
 	if err != nil {
@@ -215,19 +224,16 @@ func (tpx *TPXServer) updateAllowedIPs() error {
 	}
 
 	// unmarshal the body
-	var allowedIPs GetAllowedIPJSON
-	err = json.Unmarshal(body, &allowedIPs)
+	var configJSON ConfigJSON
+	err = json.Unmarshal(body, &configJSON)
 	if err != nil {
 		return err
 	}
 
-	// create the map
-	ipAllowed := map[string]bool{}
-	for _, ip := range allowedIPs.AllowedIPs {
-		ipAllowed[ip] = true
+	if err := tpx.processConfig(&configJSON); err != nil {
+		return err
 	}
 
-	tpx.ipAllowed = ipAllowed
 	return nil
 }
 
@@ -249,7 +255,7 @@ func (tpx *TPXServer) updateHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	// this will trigger system to make API call to get new list of IPs
-	if err := tpx.updateAllowedIPs(); err != nil {
+	if err := tpx.getConfig(); err != nil {
 		log.Println("error getting allowed ips: ", err.Error())
 		return
 	}
@@ -264,12 +270,45 @@ func (tpx *TPXServer) startAPIServer() {
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
 
+func (tpx *TPXServer) processConfig(configJSON *ConfigJSON) error {
+	// create the map
+	ipAccessControl := map[string]bool{}
+	for _, ip := range configJSON.AllowedIPs {
+		ipAccessControl[ip] = true
+	}
+
+	for _, ip := range configJSON.BlockedIPs {
+		ipAccessControl[ip] = false
+	}
+
+	tpx.ipAccessControl = ipAccessControl
+	tpx.defaultAllow = configJSON.DefaultAllow
+	return nil
+}
+
 func (tpx *TPXServer) Start() {
+
+	// read local config file
+
+	configData, err := os.ReadFile("config.json")
+	if err != nil {
+		log.Fatal("error reading config file: ", err.Error())
+	}
+	// parse config
+	var config ConfigJSON
+	err = json.Unmarshal(configData, &config)
+	if err != nil {
+		log.Fatal("error parsing config file: ", err.Error())
+	}
+
+	if err := tpx.processConfig(&config); err != nil {
+		log.Fatal("error processing config: ", err.Error())
+	}
 
 	if tpx.apiURL != "" {
 		// if api url is set, then we need to call the API to get the list of allowed ips
 		// get the list of allowed ips
-		err := tpx.updateAllowedIPs()
+		err := tpx.getConfig()
 		if err != nil {
 			log.Fatal("error getting allowed ips: ", err.Error())
 		}
