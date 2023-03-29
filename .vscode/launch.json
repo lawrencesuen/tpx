@@ -9,6 +9,9 @@
             "type": "go",
             "request": "launch",
             "mode": "auto",
+            "env":{
+                "TPX_DEBUG": "2"
+            },
             "program": "${fileDirname}"
         }
     ]

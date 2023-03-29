@@ -37,13 +37,23 @@ import (
 	"time"
 )
 
-type TPXServer struct {
-	debug           TPXDebugLevel
-	resolver        *net.Resolver
+type ConfigJSON struct {
+	DefaultAllow bool     `json:"defaultAllow"`
+	AllowedIPs   []string `json:"allowedIPs"`
+	BlockedIPs   []string `json:"blockedIPs"`
+}
+
+type AccessControlConfig struct {
 	ipAccessControl map[string]bool
-	apiURL          string
-	accessToken     string
 	defaultAllow    bool
+}
+
+type TPXServer struct {
+	debug       TPXDebugLevel
+	resolver    *net.Resolver
+	config      *AccessControlConfig
+	apiURL      string
+	accessToken string
 }
 
 type TPXDebugLevel int
@@ -56,10 +66,13 @@ const (
 
 func NewTPXServer(dnsIP string, debug TPXDebugLevel, apiURL string, accessToken string) *TPXServer {
 	tpx := &TPXServer{
-		debug:           debug,
-		ipAccessControl: map[string]bool{},
-		apiURL:          apiURL,
-		accessToken:     accessToken,
+		debug: debug,
+		config: &AccessControlConfig{
+			ipAccessControl: map[string]bool{},
+			defaultAllow:    false,
+		},
+		apiURL:      apiURL,
+		accessToken: accessToken,
 		resolver: &net.Resolver{
 			PreferGo: true,
 		},
@@ -92,10 +105,10 @@ func (tpx *TPXServer) handleConnection(conn net.Conn) {
 		return
 	}
 	// check if the ip is allowed
-	accessControlResult, ok := tpx.ipAccessControl[ip]
+	accessControlResult, ok := tpx.config.ipAccessControl[ip]
 
 	if !ok {
-		accessControlResult = tpx.defaultAllow
+		accessControlResult = tpx.config.defaultAllow
 	}
 
 	if !accessControlResult {
@@ -191,12 +204,6 @@ func (tpx *TPXServer) handleConnection(conn net.Conn) {
 	}
 }
 
-type ConfigJSON struct {
-	DefaultAllow bool     `json:"defaultAllow"`
-	AllowedIPs   []string `json:"allowedIPs"`
-	BlockedIPs   []string `json:"blockedIPs"`
-}
-
 func (tpx *TPXServer) getConfig() error {
 	// create a new request
 	req, err := http.NewRequest("GET", tpx.apiURL, nil)
@@ -238,19 +245,17 @@ func (tpx *TPXServer) getConfig() error {
 
 func (tpx *TPXServer) updateHandler(w http.ResponseWriter, r *http.Request) {
 	// check authorization
-	if tpx.accessToken != "" {
-		// get the authorization header
-		authHeader := r.Header.Get("Authorization")
-		// check if the header is empty
-		if authHeader == "" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		// check if the header is valid
-		if authHeader != fmt.Sprintf("Bearer %s", tpx.accessToken) {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
+	// get the authorization header
+	authHeader := r.Header.Get("Authorization")
+	// check if the header is empty
+	if authHeader == "" {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	// check if the header is valid
+	if authHeader != fmt.Sprintf("Bearer %s", tpx.accessToken) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
 	}
 	w.WriteHeader(http.StatusOK)
 	// this will trigger system to make API call to get new list of IPs
@@ -264,7 +269,7 @@ func (tpx *TPXServer) startAPIServer() {
 	// create a new mux
 	mux := http.NewServeMux()
 	// add the handler
-	mux.HandleFunc("/update", tpx.updateHandler)
+	mux.HandleFunc("/triggerUpdate", tpx.updateHandler)
 	// start the server
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
@@ -280,8 +285,14 @@ func (tpx *TPXServer) processConfig(configJSON *ConfigJSON) error {
 		ipAccessControl[ip] = false
 	}
 
-	tpx.ipAccessControl = ipAccessControl
-	tpx.defaultAllow = configJSON.DefaultAllow
+	config := &AccessControlConfig{
+		ipAccessControl: ipAccessControl,
+		defaultAllow:    configJSON.DefaultAllow,
+	}
+
+	// we want to do this atomically
+	tpx.config = config
+
 	return nil
 }
 
@@ -304,17 +315,16 @@ func (tpx *TPXServer) Start() {
 		log.Fatal("error processing config: ", err.Error())
 	}
 
-	if tpx.apiURL != "" {
-		// if api url is set, then we need to call the API to get the list of allowed ips
-		// get the list of allowed ips
+	if tpx.apiURL != "" || tpx.accessToken != "" {
+		if tpx.apiURL == "" || tpx.accessToken == "" {
+			log.Fatal("api url and access token must both be set or not set at all")
+		}
+		// if api url is set, then we need to call the API to get the latest config
 		err := tpx.getConfig()
 		if err != nil {
 			log.Fatal("error getting allowed ips: ", err.Error())
 		}
-	}
-
-	if tpx.accessToken != "" {
-		// if access token is set, then we need to start web server to handle API calls for updates to allowed ips
+		// we need to start web server to handle API calls for updates to allowed ips
 		go tpx.startAPIServer()
 	}
 
