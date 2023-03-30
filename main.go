@@ -33,19 +33,29 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
 
 type ConfigJSON struct {
-	DefaultAllow bool     `json:"defaultAllow"`
-	AllowedIPs   []string `json:"allowedIPs"`
-	BlockedIPs   []string `json:"blockedIPs"`
+	IPControl          bool     `json:"ipControl"`
+	DefaultAllowIP     bool     `json:"defaultAllowIP"`
+	AllowedIPs         []string `json:"allowedIPs"`
+	BlockedIPs         []string `json:"blockedIPs"`
+	DomainControl      bool     `json:"domainControl"`
+	DefaultAllowDomain bool     `json:"defaultAllowDomain"`
+	AllowedDomains     []string `json:"allowedDomains"`
+	BlockedDomains     []string `json:"blockedDomains"`
 }
 
 type AccessControlConfig struct {
-	ipAccessControl map[string]bool
-	defaultAllow    bool
+	ipControl           bool
+	ipAccessControl     map[string]bool
+	defaultAllowIP      bool
+	domainControl       bool
+	domainAccessControl map[string]bool
+	defaultAllowDomain  bool
 }
 
 type TPXServer struct {
@@ -68,8 +78,12 @@ func NewTPXServer(dnsIP string, debug TPXDebugLevel, apiURL string, accessToken 
 	tpx := &TPXServer{
 		debug: debug,
 		config: &AccessControlConfig{
-			ipAccessControl: map[string]bool{},
-			defaultAllow:    false,
+			ipControl:           false,
+			ipAccessControl:     map[string]bool{},
+			defaultAllowIP:      false,
+			domainControl:       false,
+			domainAccessControl: map[string]bool{},
+			defaultAllowDomain:  false,
 		},
 		apiURL:      apiURL,
 		accessToken: accessToken,
@@ -104,18 +118,21 @@ func (tpx *TPXServer) handleConnection(conn net.Conn) {
 		}
 		return
 	}
-	// check if the ip is allowed
-	accessControlResult, ok := tpx.config.ipAccessControl[ip]
 
-	if !ok {
-		accessControlResult = tpx.config.defaultAllow
-	}
+	if tpx.config.ipControl {
+		// check if the ip is allowed
+		accessControlResult, ok := tpx.config.ipAccessControl[ip]
 
-	if !accessControlResult {
-		if tpx.debug >= TPXDebugLevelInfo {
-			log.Println("ip not allowed: ", ip)
+		if !ok {
+			accessControlResult = tpx.config.defaultAllowIP
 		}
-		return
+
+		if !accessControlResult {
+			if tpx.debug >= TPXDebugLevelInfo {
+				log.Println("ip not allowed: ", ip)
+			}
+			return
+		}
 	}
 
 	// create reader and writer
@@ -128,12 +145,61 @@ func (tpx *TPXServer) handleConnection(conn net.Conn) {
 	}
 	info := tlsparser.UnmarshalClientHello(tlsParserConnection.ClientHello)
 
-	// connect to actual server
-	if tpx.debug >= TPXDebugLevelInfo {
-		log.Println("connecting to remote server: ", *info.Info.ServerName)
+	targetDomainName := strings.ToLower(*info.Info.ServerName)
+
+	if len(targetDomainName) < 4 || len(targetDomainName) > 255 {
+		if tpx.debug >= TPXDebugLevelInfo {
+			log.Println("domain too long or too short: ", targetDomainName)
+		}
+		return
 	}
 
-	addrs, err := tpx.resolver.LookupHost(context.Background(), *info.Info.ServerName)
+	if tpx.config.domainControl {
+		// check if the domain is allowed
+
+		// split by dot
+		domainParts := strings.Split(targetDomainName, ".")
+
+		if len(domainParts) < 2 || len(domainParts) > 10 {
+			// invalid domain
+			if tpx.debug >= TPXDebugLevelInfo {
+				log.Println("invalid domain: ", targetDomainName)
+			}
+			return
+		}
+
+		for i := 0; i < len(domainParts)-1; i++ {
+			subDomainName := strings.Join(domainParts[i:], ".")
+
+			domainAllowed, ok := tpx.config.domainAccessControl[subDomainName]
+
+			if !ok {
+				// no match
+				// is this the last one?
+				if i == len(domainParts)-2 {
+					// yes, use the default
+					domainAllowed = tpx.config.defaultAllowDomain
+				} else {
+					// no, continue
+					continue
+				}
+			}
+
+			if !domainAllowed {
+				if tpx.debug >= TPXDebugLevelInfo {
+					log.Println("domain not allowed: ", targetDomainName)
+				}
+				return
+			}
+		}
+	}
+
+	// connect to actual server
+	if tpx.debug >= TPXDebugLevelInfo {
+		log.Println("looking up remote server: ", targetDomainName)
+	}
+
+	addrs, err := tpx.resolver.LookupHost(context.Background(), targetDomainName)
 	if err != nil {
 		if tpx.debug >= TPXDebugLevelInfo {
 			log.Println("error resolving remote server: ", err.Error())
@@ -285,9 +351,22 @@ func (tpx *TPXServer) processConfig(configJSON *ConfigJSON) error {
 		ipAccessControl[ip] = false
 	}
 
+	domainAccessControl := map[string]bool{}
+	for _, domainName := range configJSON.AllowedDomains {
+		domainAccessControl[domainName] = true
+	}
+
+	for _, domainName := range configJSON.BlockedDomains {
+		domainAccessControl[domainName] = false
+	}
+
 	config := &AccessControlConfig{
-		ipAccessControl: ipAccessControl,
-		defaultAllow:    configJSON.DefaultAllow,
+		ipControl:           configJSON.IPControl,
+		ipAccessControl:     ipAccessControl,
+		defaultAllowIP:      configJSON.DefaultAllowIP,
+		domainControl:       configJSON.DomainControl,
+		domainAccessControl: domainAccessControl,
+		defaultAllowDomain:  configJSON.DefaultAllowDomain,
 	}
 
 	// we want to do this atomically
